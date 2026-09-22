@@ -105,22 +105,45 @@
       return;
     }
 
-    var dur = cssVar("--text-swap-dur", 150);
+    var exitDur = cssVar("--text-swap-dur", 120);
+    var enterDur = cssVar("--text-swap-enter-dur", 240);
     var blocks = getSwapBlocks();
+    // Hero first, then everything else in document order: the hero copy
+    // is the most prominent thing on screen, so it should be the first
+    // to resolve in the re-typeset ripple rather than whatever happens
+    // to sit earliest in the markup (the header nav).
+    var ordered = [].slice.call(blocks).sort(function (a, b) {
+      var aHero = a.closest(".hero") ? 0 : 1;
+      var bHero = b.closest(".hero") ? 0 : 1;
+      return aHero - bHero;
+    });
+
+    // Exit is synchronised, not staggered: everything fades out together
+    // over exitDur so the content swap below has one clean, fast, fixed
+    // point to land on, instead of waiting on a long tail of staggered
+    // exits (that is what made the previous version feel laggy).
     for (var i = 0; i < blocks.length; i++) { blocks[i].classList.add("is-exit"); }
 
     window.setTimeout(function () {
       applyLangAttributes(lang);
-      for (var j = 0; j < blocks.length; j++) {
-        var el = blocks[j];
-        el.classList.remove("is-exit");
-        el.classList.add("is-enter-start");
-      }
-      void document.body.offsetHeight; // force reflow so the enter state transitions
-      for (var k = 0; k < blocks.length; k++) { blocks[k].classList.remove("is-enter-start"); }
       setLangPill(true);
       repositionNavIndicator();
-    }, dur);
+      // The re-typeset ripple lives entirely in the enter phase: capped
+      // at 6 steps of 20ms (120ms max tail) so it reads as one soft
+      // resettle, not a slow crawl down the page.
+      var STEP = 20;
+      var MAX_STEPS = 6;
+      for (var j = 0; j < ordered.length; j++) {
+        ordered[j].style.transitionDelay = (Math.min(j, MAX_STEPS) * STEP) + "ms";
+        ordered[j].classList.remove("is-exit");
+        ordered[j].classList.add("is-enter-start");
+      }
+      void document.body.offsetHeight; // force reflow so the enter state transitions
+      for (var k = 0; k < ordered.length; k++) { ordered[k].classList.remove("is-enter-start"); }
+      window.setTimeout(function () {
+        for (var m = 0; m < ordered.length; m++) { ordered[m].style.transitionDelay = ""; }
+      }, enterDur + (MAX_STEPS * STEP) + 40);
+    }, exitDur);
   }
 
   function initLanguage() {
@@ -187,6 +210,17 @@
       repositionNavIndicator();
     }
 
+    // The indicator should jump to the clicked link immediately rather
+    // than waiting for the smooth scroll to settle and the intersection
+    // observer below to catch up.
+    var allLinks = [].slice.call(deskLinks).concat([].slice.call(mobLinks));
+    for (var li = 0; li < allLinks.length; li++) {
+      allLinks[li].addEventListener("click", function () {
+        var id = this.getAttribute("href").slice(1);
+        if (id) { setActive(id); }
+      });
+    }
+
     if (!("IntersectionObserver" in window) || sections.length === 0) { return; }
     try {
       var headerH = document.querySelector(".site-header");
@@ -196,7 +230,12 @@
         for (var i = 0; i < entries.length; i++) {
           var entry = entries[i];
           if (entry.isIntersecting) {
-            if (!best || entry.boundingClientRect.top < best.boundingClientRect.top) { best = entry; }
+            // Prefer the section whose top is closest to (but still within)
+            // the detection band, i.e. the largest top among candidates:
+            // sections are stacked with no gaps, so when two overlap the
+            // band (one ending, one starting) the one that just started is
+            // the section actually in view, not the one mostly scrolled past.
+            if (!best || entry.boundingClientRect.top > best.boundingClientRect.top) { best = entry; }
           }
         }
         if (best) { setActive(best.target.id); }
@@ -229,41 +268,67 @@
   /* Hero text reveal on load (texts-reveal pattern)                     */
   /* ------------------------------------------------------------------ */
   function initHeroReveal() {
+    var hero = document.querySelector(".hero");
     var block = document.querySelector(".hero-copy.t-stagger");
-    if (!block) { return; }
+    if (!hero || !block) { return; }
     if (reduceMotion) { return; }
+    hero.classList.add("is-armed");
     block.classList.add("is-armed");
+    // Force a synchronous style/layout flush so the browser commits the
+    // armed (hidden) styles as the current computed state before anything
+    // else runs. Without this, a double rAF is not reliable everywhere
+    // (some engines can fire both callbacks within the same tick, before
+    // the armed state is ever used as a transition start point), which
+    // makes the whole entrance skip straight to the shown state.
+    void hero.offsetHeight;
     var shown = false;
     var show = function () {
       if (shown) { return; }
       shown = true;
+      hero.classList.remove("is-armed");
+      hero.classList.add("is-shown");
       block.classList.remove("is-armed");
       block.classList.add("is-shown");
     };
     requestAnimationFrame(function () { requestAnimationFrame(show); });
-    window.setTimeout(show, 1200); // safety net
+    window.setTimeout(show, 1800); // safety net: never keep the hero hidden
   }
 
   /* ------------------------------------------------------------------ */
   /* Section reveal on scroll                                             */
   /* ------------------------------------------------------------------ */
   function initSectionReveal() {
-    var items = document.querySelectorAll(".t-reveal");
-    if (items.length === 0) { return; }
+    var sections = document.querySelectorAll(".section");
+    if (sections.length === 0) { return; }
     if (reduceMotion) { return; }
 
-    var revealed = [];
     function forceRevealAll() {
-      for (var i = 0; i < items.length; i++) {
-        items[i].classList.remove("is-armed");
-        items[i].classList.add("is-shown");
+      for (var i = 0; i < sections.length; i++) {
+        sections[i].classList.remove("is-armed");
+        sections[i].classList.add("is-shown");
       }
     }
 
     if (!("IntersectionObserver" in window)) { return; } // default CSS state is already visible
 
     try {
-      for (var i = 0; i < items.length; i++) { items[i].classList.add("is-armed"); }
+      var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      var toObserve = [];
+      for (var i = 0; i < sections.length; i++) {
+        var rect = sections[i].getBoundingClientRect();
+        // A section already substantially in view on load (threshold 0.18
+        // from the bottom, mirrored here) plays no entrance at all: only
+        // the hero sequence animates on load, per the motion spec.
+        if (rect.top < vh * 0.82 && rect.bottom > 0) {
+          sections[i].classList.add("is-shown");
+        } else {
+          sections[i].classList.add("is-armed");
+          toObserve.push(sections[i]);
+        }
+      }
+      // Force a style flush so the armed state is committed before the
+      // observer can flip anything to shown (see initHeroReveal for why).
+      if (toObserve.length) { void toObserve[0].offsetHeight; }
       var obs = new IntersectionObserver(function (entries, observer) {
         for (var j = 0; j < entries.length; j++) {
           if (entries[j].isIntersecting) {
@@ -272,11 +337,11 @@
             observer.unobserve(entries[j].target);
           }
         }
-      }, { threshold: 0.12, rootMargin: "0px 0px -8% 0px" });
-      for (var k = 0; k < items.length; k++) { obs.observe(items[k]); }
+      }, { threshold: 0.18 });
+      for (var k = 0; k < toObserve.length; k++) { obs.observe(toObserve[k]); }
       // Safety net: an observer bug or a section that never intersects
-      // (e.g. a very short viewport) must not leave content invisible.
-      window.setTimeout(forceRevealAll, 5000);
+      // must not leave content invisible.
+      window.setTimeout(forceRevealAll, 1800);
     } catch (e) {
       forceRevealAll();
     }
@@ -290,20 +355,50 @@
     if (!grid) { return; }
     var groups = grid.querySelectorAll(".t-digit-group");
     function animate() {
+      grid.classList.remove("is-armed");
+      grid.classList.add("is-animating");
       for (var i = 0; i < groups.length; i++) { groups[i].classList.add("is-animating"); }
     }
     if (reduceMotion || !("IntersectionObserver" in window)) { animate(); return; }
     try {
+      var vh = window.innerHeight || document.documentElement.clientHeight || 0;
+      var rect = grid.getBoundingClientRect();
+      // Already in view on load: show the final numbers immediately,
+      // no pop-in, no prefix/caption fade (only the hero plays on load).
+      if (rect.top < vh * 0.7 && rect.bottom > 0) {
+        for (var g = 0; g < groups.length; g++) { groups[g].classList.add("is-animating"); }
+        return;
+      }
+      grid.classList.add("is-armed");
+      void grid.offsetHeight; // force-commit the armed state, see initHeroReveal
       var obs = new IntersectionObserver(function (entries, observer) {
-        for (var i = 0; i < entries.length; i++) {
-          if (entries[i].isIntersecting) { animate(); observer.disconnect(); break; }
+        for (var j = 0; j < entries.length; j++) {
+          if (entries[j].isIntersecting) { animate(); observer.disconnect(); break; }
         }
       }, { threshold: 0.3 });
       obs.observe(grid);
-      window.setTimeout(animate, 5000); // safety net
+      window.setTimeout(animate, 1800); // safety net
     } catch (e) {
       animate();
     }
+  }
+
+  /* ------------------------------------------------------------------ */
+  /* Header: soft shadow and denser background past 24px of scroll        */
+  /* ------------------------------------------------------------------ */
+  function initHeaderScroll() {
+    var header = document.querySelector(".site-header");
+    if (!header) { return; }
+    var ticking = false;
+    function update() {
+      ticking = false;
+      if (window.scrollY > 24) { header.classList.add("is-scrolled"); }
+      else { header.classList.remove("is-scrolled"); }
+    }
+    window.addEventListener("scroll", function () {
+      if (!ticking) { ticking = true; requestAnimationFrame(update); }
+    }, { passive: true });
+    update();
   }
 
   /* ------------------------------------------------------------------ */
@@ -338,6 +433,7 @@
     try { initSectionReveal(); } catch (e) {}
     try { initNumberPopIn(); } catch (e) {}
     try { initProgressRule(); } catch (e) {}
+    try { initHeaderScroll(); } catch (e) {}
   }
 
   if (document.readyState === "loading") {
